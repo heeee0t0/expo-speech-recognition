@@ -63,6 +63,9 @@ class ExpoSpeechService(
     private var lastDetectedLanguage: String? = null
     private var lastLanguageConfidence: Float? = null
 
+    private var beginningOfSpeechTime: Long? = null //speech start time for cutting audio file chunk
+    private var endOfSpeechTime: Long? = null //speech end time for cutting audio file chunk
+
     var recognitionState = RecognitionState.INACTIVE
 
     companion object {
@@ -117,6 +120,7 @@ class ExpoSpeechService(
         this.options = options
         mainHandler.post {
             log("Start recognition.")
+            log("🟢 [start] options: $options")
 
             // Destroy any previous SpeechRecognizer / audio recorder
             speech?.destroy()
@@ -460,11 +464,14 @@ class ExpoSpeechService(
     }
 
     override fun onBeginningOfSpeech() {
+        beginningOfSpeechTime = System.currentTimeMillis() // start speech time for cutting audio chunk
         sendEvent("speechstart", null)
+        log("onBeginningOfSpeech()")
     }
 
     override fun onRmsChanged(rmsdB: Float) {
         if (options.volumeChangeEventOptions?.enabled != true) {
+            //log("📶 [SpeechRecognizer] RMS changed: $rmsdB dB") // following rmsdB change
             return
         }
 
@@ -505,10 +512,12 @@ class ExpoSpeechService(
 
     override fun onBufferReceived(buffer: ByteArray?) {
         // More sound has been received.
+        log("📥 [SpeechRecognizer] Buffer received: size=${buffer?.size}")
     }
 
     override fun onEndOfSpeech() {
         // recognitionState = RecognitionState.INACTIVE
+        endOfSpeechTime = System.currentTimeMillis() // speech end time for cutting audio chunk
         sendEvent("speechend", null)
         log("onEndOfSpeech()")
     }
@@ -595,6 +604,28 @@ class ExpoSpeechService(
             else -> 0.0f
         }
 
+    private fun maybeSaveSegmentIfTranscriptValid( // save .wav file with recording options
+        transcript: String?,
+        resultsList: List<Map<String, Any>>
+    ): File? {
+        if (transcript.isNullOrBlank()) return null
+
+        //val start = (beginningOfSpeechTime ?: System.currentTimeMillis())
+        val start = (beginningOfSpeechTime ?: System.currentTimeMillis()) - 200
+        val end = (endOfSpeechTime ?: System.currentTimeMillis()) - 800
+        val directory = options.recordingOptions?.outputDirectory
+            ?.removePrefix("file://")
+            ?.trimEnd('/')
+            ?: reactContext.cacheDir.absolutePath
+        val prefix = options.recordingOptions?.outputFileName ?: "recording_"
+        val timestamp = System.currentTimeMillis()
+        val fileName = "${prefix}${timestamp}.wav"
+        val path = "$directory/$fileName"
+        log("🎯 saveWavSegment() 시도: $start ~ $end -> $path")
+
+        return audioRecorder?.saveWavSegment(start, end, path)
+    }
+
     override fun onResults(results: Bundle?) {
         val resultsList = getResults(results)
 
@@ -604,11 +635,15 @@ class ExpoSpeechService(
             // when the speech recognition service returns a final result with no significant recognition.
             sendEvent("nomatch", null)
         } else {
+            val transcript = resultsList[0]["transcript"]?.toString()?.trim()
+            val wavFile = maybeSaveSegmentIfTranscriptValid(transcript, resultsList) // uri for send to server
+
             sendEvent(
                 "result",
                 mapOf(
                     "results" to resultsList,
                     "isFinal" to true,
+                    "uri" to wavFile?.absolutePath?.let { "file://$it" }
                 ),
             )
         }
@@ -656,11 +691,15 @@ class ExpoSpeechService(
         if (resultsList.isEmpty()) {
             sendEvent("nomatch", null)
         } else {
+            val transcript = resultsList[0]["transcript"]?.toString()?.trim()
+            val wavFile = maybeSaveSegmentIfTranscriptValid(transcript, resultsList)
+
             sendEvent(
                 "result",
                 mapOf(
                     "results" to resultsList,
                     "isFinal" to true,
+                    "uri" to wavFile?.absolutePath?.let { "file://$it" }
                 ),
             )
         }

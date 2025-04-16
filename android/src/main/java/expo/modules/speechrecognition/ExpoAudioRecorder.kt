@@ -37,12 +37,15 @@ class ExpoAudioRecorder(
     var outputFileUri = "file://$outputFilePath"
 
     /** The file where the mic stream is being output to */
-    private val tempPcmFile: File
+    private val tempPcmFile: File = createTempPcmFile()
     val recordingParcel: ParcelFileDescriptor
     private var outputStream: AutoCloseOutputStream?
+    
+    private val bufferQueue = mutableListOf<Pair<Long, ByteArray>>() // buffer
+    var beginningOfSpeechTime: Long? = null
 
     init {
-        tempPcmFile = createTempPcmFile()
+        // tempPcmFile = createTempPcmFile()
         try {
             val pipe = ParcelFileDescriptor.createPipe()
             recordingParcel = pipe[0]
@@ -105,7 +108,7 @@ class ExpoAudioRecorder(
                 try {
                     val pcmData = pcmFile.readBytes()
                     out.write(pcmData)
-                    pcmFile.delete()
+                    // pcmFile.delete() // pcmFile deleted another sequence
                 } catch (e: IOException) {
                     Log.e(TAG, "Failed to read PCM file", e)
                     e.printStackTrace()
@@ -156,6 +159,7 @@ class ExpoAudioRecorder(
                     streamAudioToPipe()
                 }
         }
+        Log.d(TAG, "🎙️ [AudioRecorder] Started recording to pipe and file: $tempPcmFile")
     }
 
     override fun stop() {
@@ -192,26 +196,80 @@ class ExpoAudioRecorder(
         }
     }
 
+    fun saveWavSegment(fromTime: Long, toTime: Long, customFilePath: String): File? { // save wav file
+        // 1. 시간 범위에 해당하는 버퍼 추출
+        val selectedChunks = synchronized(bufferQueue) {
+            bufferQueue.filter { it.first in fromTime..toTime }
+                .map { it.second }
+        }
+
+        if (selectedChunks.isEmpty()) {
+            Log.w(TAG, "❗ 선택된 PCM 청크가 없습니다. 저장하지 않음")
+            return null
+        }
+
+        // 2. ByteArrayOutputStream으로 병합
+        val outputStream = java.io.ByteArrayOutputStream()
+        try {
+            selectedChunks.forEach { chunk ->
+                outputStream.write(chunk)
+            }
+        } catch (e: IOException) {
+            Log.e(TAG, "❌ PCM 병합 실패", e)
+            return null
+        }
+
+        val pcmBytes = outputStream.toByteArray()
+
+        // 3. 임시 PCM 파일에 저장
+        val pcmFile = File(context.cacheDir, "seg_${UUID.randomUUID()}.pcm")
+        try {
+            pcmFile.writeBytes(pcmBytes)
+        } catch (e: IOException) {
+            Log.e(TAG, "❌ PCM 파일 저장 실패", e)
+            return null
+        }
+
+        // 4. WAV로 변환
+        return try {
+            val wavFile = appendWavHeader(customFilePath, pcmFile, sampleRateInHz)
+            Log.i(TAG, "✅ saveWavSegment 성공: ${wavFile.absolutePath}, size=${wavFile.length()} bytes")
+            // 🧹 저장 후 .pcm 삭제
+            val deleted = pcmFile.delete()
+            Log.d(TAG, "🧹 임시 PCM 삭제됨: ${pcmFile.absolutePath}, 성공 여부: $deleted")
+
+            wavFile
+        } catch (e: IOException) {
+            Log.e(TAG, "❌ saveWavSegment: WAV 저장 실패", e)
+            null
+        }
+    }
+
     private fun streamAudioToPipe() {
-        val tempFileOutputStream = FileOutputStream(tempPcmFile)
+        // val tempFileOutputStream = FileOutputStream(tempPcmFile)
         val data = ByteArray(bufferSizeInBytes / 2)
 
         while (isRecordingAudio) {
             val read = audioRecorder!!.read(data, 0, data.size)
+            val currentTime = System.currentTimeMillis()
+            val chunk = data.copyOf(read)
+            synchronized(bufferQueue) {
+                bufferQueue.add(currentTime to chunk)
+            }
             try {
                 outputStream?.write(data, 0, read)
                 outputStream?.flush()
 
-                // Write to the temp PCM file
-                if (outputFilePath != null) {
-                    tempFileOutputStream.write(data, 0, read)
-                    tempFileOutputStream.flush()
-                }
+                // // Write to the temp PCM file
+                // if (outputFilePath != null) {
+                //     tempFileOutputStream.write(data, 0, read)
+                //     tempFileOutputStream.flush()
+                // }
             } catch (e: IOException) {
                 Log.e(TAG, "Failed to write to output stream", e)
                 e.printStackTrace()
             }
         }
-        tempFileOutputStream.close()
+        // tempFileOutputStream.close()
     }
 }
