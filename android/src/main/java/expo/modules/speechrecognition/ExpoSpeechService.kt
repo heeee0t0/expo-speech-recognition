@@ -66,6 +66,19 @@ class ExpoSpeechService(
     private var beginningOfSpeechTime: Long? = null //speech start time for cutting audio file chunk
     private var endOfSpeechTime: Long? = null //speech end time for cutting audio file chunk
 
+    // 📌 onRmsChanged() 관련 전역 상태 관리 변수들
+    private val rmsWindow = mutableListOf<Float>()
+    private var isRecordingSegment = false
+    private var speechStartTime: Long? = null
+    private var lastSpeechRmsTime: Long = 0
+    private val savedRmsSegments = mutableListOf<String>()  // ✅ 여러 RMS segment 저장
+
+    // 📌 RMS 기반 저장된 wav 파일 경로 추적
+    private var rmsSavedFilePath: String? = null
+
+    // 📌 로그 태그
+    private val TAG = "ExpoSpeechService"
+
     var recognitionState = RecognitionState.INACTIVE
 
     companion object {
@@ -466,49 +479,101 @@ class ExpoSpeechService(
     override fun onBeginningOfSpeech() {
         beginningOfSpeechTime = System.currentTimeMillis() // start speech time for cutting audio chunk
         sendEvent("speechstart", null)
-        log("onBeginningOfSpeech()")
+        log("onBeginningOfSpeechTime: $beginningOfSpeechTime")
     }
 
     override fun onRmsChanged(rmsdB: Float) {
-        if (options.volumeChangeEventOptions?.enabled != true) {
-            //log("📶 [SpeechRecognizer] RMS changed: $rmsdB dB") // following rmsdB change
-            return
-        }
+        val now = System.currentTimeMillis()
+        // log("📶 [SpeechRecognizer] RMS changed: $rmsdB dB") // following rmsdB change
 
-        val intervalMs = options.volumeChangeEventOptions?.intervalMillis
+        rmsWindow.add(rmsdB)
+        if (rmsWindow.size > 10) rmsWindow.removeFirst()
 
-        if (intervalMs == null) {
-            sendEvent("volumechange", mapOf("value" to rmsdB))
-        } else {
-            val currentTime = System.currentTimeMillis()
-            if (currentTime - lastVolumeChangeEventTime >= intervalMs) {
-                sendEvent("volumechange", mapOf("value" to rmsdB))
-                lastVolumeChangeEventTime = currentTime
+        val ambientAvg = rmsWindow.average()
+        val isVoiced = rmsWindow.count { it > ambientAvg + 2.0f } >= 5 // 주변 소음보다 2dB 큰 소리가 5개 이상이면 음성으로 간주
+        // val isVoiced = rmsWindow.count { it > -5.0f } >= 5 // 큰 소리가 5개 이상이면 음성으로 간주
+        val deltas = rmsWindow.zipWithNext { a, b -> kotlin.math.abs(b - a) } // RMS 변화량
+        val avgDelta = deltas.average().toFloat() // 소리 변화량 - 백색 소음 등 변화 없는 단순 잡은 제거
+        val crossings = rmsWindow.windowed(2).count { (a, b) -> (a - b) * (rmsWindow.first() - a) < 0 } // 특정한 리듬이 있는지(사람 말소리 여부) 확인
+        // val rmsChange = rmsWindow.last() - rmsWindow.first() // RMS 변화량 - 음성인지 아닌지 확인
+        // val intervalMillis = 100
+        // val windowDurationInMillis = rmsWindow.size * intervalMillis // RMS 변화량을 측정한 시간
+        // val attackRate = rmsChange/ (windowDurationInMillis / 1000f) //초당 db가 얼마나 변화했는지 , 즉 짧은 시간에 급상승 유무
+        // val isLikelySpeech = isVoiced && avgDelta > 1.0f && crossings >= 5 && attackRate > 10 // 위의 4 가지 조건을 모두 만족해야 음성으로 간주
+        val isLikelySpeech = isVoiced && avgDelta > 1.0f && crossings >= 5 // 위의 3 가지 조건을 모두 만족해야 음성으로 간주
+
+        if (isLikelySpeech) {
+            if (!isRecordingSegment) {
+                speechStartTime = now - 300//300ms 마진
+                isRecordingSegment = true
             }
-        }
-        /*
-        val isSilent = rmsdB <= 0
-
-        if (!isSilent) {
-            lastTimeSoundDetected = System.currentTimeMillis()
+            lastSpeechRmsTime = now
         }
 
-        // Call "soundstart" event if not already called
-        if (!isSilent && soundState != SoundState.ACTIVE) {
-            sendEvent("soundstart", null)
-            soundState = SoundState.ACTIVE
-            log("Changed sound state to ACTIVE")
-            return
-        }
+        if (isRecordingSegment && now - lastSpeechRmsTime > 300) {
+            val speechEndTime = lastSpeechRmsTime + 200 // 200ms 마진
+            val directory = options.recordingOptions?.outputDirectory
+                ?.removePrefix("file://")?.trimEnd('/')
+                ?: reactContext.cacheDir.absolutePath
+            val prefix = options.recordingOptions?.outputFileName ?: "smart_voice_"
+            val timestamp = System.currentTimeMillis()
+            val fileName = "${prefix}${timestamp}_rms.wav"
+            val path = "$directory/$fileName"
 
-        // If the sound is silent for more than 150ms, send "soundend" event
-        if (isSilent && soundState == SoundState.ACTIVE && (System.currentTimeMillis() - lastTimeSoundDetected) > 150) {
-            sendEvent("soundend", null)
-            soundState = SoundState.SILENT
-            log("Changed sound state to SILENT")
+            Log.d(TAG, "🎯 [RMS Segment Save] $speechStartTime ~ $speechEndTime -> $path")
+            val file = audioRecorder?.saveWavSegment(speechStartTime!!, speechEndTime, path)
+            rmsSavedFilePath = path.takeIf { file != null && File(it).exists() }
+            if (file != null && File(path).exists()) {
+                savedRmsSegments.add(path)
+                Log.d(TAG, "✅ RMS segment 저장됨: $path")
+            }
+
+            isRecordingSegment = false
+            speechStartTime = null
+            rmsWindow.clear()
         }
-         */
     }
+
+    // override fun onRmsChanged(rmsdB: Float) {
+    //     if (options.volumeChangeEventOptions?.enabled != true) {
+             // log("📶 [SpeechRecognizer] RMS changed: $rmsdB dB") // following rmsdB change
+    //         return
+    //     }
+
+    //     val intervalMs = options.volumeChangeEventOptions?.intervalMillis
+
+    //     if (intervalMs == null) {
+    //         sendEvent("volumechange", mapOf("value" to rmsdB))
+    //     } else {
+    //         val currentTime = System.currentTimeMillis()
+    //         if (currentTime - lastVolumeChangeEventTime >= intervalMs) {
+    //             sendEvent("volumechange", mapOf("value" to rmsdB))
+    //             lastVolumeChangeEventTime = currentTime
+    //         }
+    //     }
+    //     /*
+    //     val isSilent = rmsdB <= 0
+
+    //     if (!isSilent) {
+    //         lastTimeSoundDetected = System.currentTimeMillis()
+    //     }
+
+    //     // Call "soundstart" event if not already called
+    //     if (!isSilent && soundState != SoundState.ACTIVE) {
+    //         sendEvent("soundstart", null)
+    //         soundState = SoundState.ACTIVE
+    //         log("Changed sound state to ACTIVE")
+    //         return
+    //     }
+
+    //     // If the sound is silent for more than 150ms, send "soundend" event
+    //     if (isSilent && soundState == SoundState.ACTIVE && (System.currentTimeMillis() - lastTimeSoundDetected) > 150) {
+    //         sendEvent("soundend", null)
+    //         soundState = SoundState.SILENT
+    //         log("Changed sound state to SILENT")
+    //     }
+    //      */
+    // }
 
     override fun onBufferReceived(buffer: ByteArray?) {
         // More sound has been received.
@@ -519,7 +584,7 @@ class ExpoSpeechService(
         // recognitionState = RecognitionState.INACTIVE
         endOfSpeechTime = System.currentTimeMillis() // speech end time for cutting audio chunk
         sendEvent("speechend", null)
-        log("onEndOfSpeech()")
+        log("onEndOfSpeechTime: $endOfSpeechTime")
     }
 
     override fun onError(error: Int) {
@@ -611,8 +676,8 @@ class ExpoSpeechService(
         if (transcript.isNullOrBlank()) return null
 
         //val start = (beginningOfSpeechTime ?: System.currentTimeMillis())
-        val start = (beginningOfSpeechTime ?: System.currentTimeMillis()) - 200
-        val end = (endOfSpeechTime ?: System.currentTimeMillis()) - 800
+        val start = (beginningOfSpeechTime ?: System.currentTimeMillis()) -300
+        val end = (endOfSpeechTime ?: System.currentTimeMillis())
         val directory = options.recordingOptions?.outputDirectory
             ?.removePrefix("file://")
             ?.trimEnd('/')
@@ -628,6 +693,23 @@ class ExpoSpeechService(
 
     override fun onResults(results: Bundle?) {
         val resultsList = getResults(results)
+        // val start = beginningOfSpeechTime ?: System.currentTimeMillis()
+        val end = endOfSpeechTime ?: System.currentTimeMillis()
+        val directory = options.recordingOptions?.outputDirectory
+            ?.removePrefix("file://")
+            ?.trimEnd('/')
+            ?: reactContext.cacheDir.absolutePath
+
+        val prefix = options.recordingOptions?.outputFileName ?: "recording_"
+        val timestamp = System.currentTimeMillis()
+
+        // val cutPath = "$directory/${prefix}${timestamp}_cut.wav"
+        val fullPath = "$directory/${prefix}${timestamp}_full.wav"
+
+        // val cutFile = audioRecorder?.saveWavSegment(start, end, cutPath)
+        val fullFile = audioRecorder?.saveFullWav(end, fullPath)
+        val rmsFiles = savedRmsSegments.filter { File(it).exists() }
+            .map { "file://$it" }
 
         if (resultsList.isEmpty()) {
             // https://developer.mozilla.org/en-US/docs/Web/API/SpeechRecognition/nomatch_event
@@ -643,9 +725,12 @@ class ExpoSpeechService(
                 mapOf(
                     "results" to resultsList,
                     "isFinal" to true,
-                    "uri" to wavFile?.absolutePath?.let { "file://$it" }
+                    "uri" to wavFile?.absolutePath?.let { "file://$it" },
+                    "uriFull" to fullFile?.absolutePath?.let { "file://$it" },
+                    "uriRms" to rmsFiles
                 ),
             )
+            savedRmsSegments.clear()
         }
         log("onResults(), results: $resultsList")
 
@@ -688,6 +773,25 @@ class ExpoSpeechService(
      */
     override fun onSegmentResults(segmentResults: Bundle) {
         val resultsList = getResults(segmentResults)
+        // val start = beginningOfSpeechTime ?: System.currentTimeMillis()
+        val end = endOfSpeechTime ?: System.currentTimeMillis()
+
+        val directory = options.recordingOptions?.outputDirectory
+            ?.removePrefix("file://")
+            ?.trimEnd('/')
+            ?: reactContext.cacheDir.absolutePath
+
+        val prefix = options.recordingOptions?.outputFileName ?: "recording_"
+        val timestamp = System.currentTimeMillis()
+
+        // val cutPath = "$directory/${prefix}${timestamp}_cut.wav"
+        val fullPath = "$directory/${prefix}${timestamp}_full.wav"
+
+        // val cutFile = audioRecorder?.saveWavSegment(start, end, cutPath)
+        val fullFile = audioRecorder?.saveFullWav(end, fullPath)
+        val rmsUris = savedRmsSegments.filter { File(it).exists() }
+            .map { "file://$it" }
+
         if (resultsList.isEmpty()) {
             sendEvent("nomatch", null)
         } else {
@@ -699,9 +803,12 @@ class ExpoSpeechService(
                 mapOf(
                     "results" to resultsList,
                     "isFinal" to true,
-                    "uri" to wavFile?.absolutePath?.let { "file://$it" }
+                    "uri" to wavFile?.absolutePath?.let { "file://$it" },
+                    "uriFull" to fullFile?.absolutePath?.let { "file://$it" },
+                    "uriRms" to rmsUris
                 ),
             )
+            savedRmsSegments.clear()
         }
         log("onSegmentResults(), transcriptions: $resultsList")
 

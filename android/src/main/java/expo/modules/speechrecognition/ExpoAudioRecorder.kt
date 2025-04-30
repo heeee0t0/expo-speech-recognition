@@ -32,6 +32,7 @@ class ExpoAudioRecorder(
     private val outputFilePath: String?,
 ) : AudioRecorder {
     private var audioRecorder: AudioRecord? = null
+    
 
     var outputFile: File? = null
     var outputFileUri = "file://$outputFilePath"
@@ -43,6 +44,7 @@ class ExpoAudioRecorder(
     
     private val bufferQueue = mutableListOf<Pair<Long, ByteArray>>() // buffer
     var beginningOfSpeechTime: Long? = null
+    var recordingStartTime: Long = 0L
 
     init {
         // tempPcmFile = createTempPcmFile()
@@ -144,6 +146,7 @@ class ExpoAudioRecorder(
     override fun start() {
         createRecorder().apply {
             audioRecorder = this
+            recordingStartTime = System.currentTimeMillis()
 
             // First check whether the above object actually initialized
             if (this.state != AudioRecord.STATE_INITIALIZED) {
@@ -210,6 +213,7 @@ class ExpoAudioRecorder(
 
         // 2. ByteArrayOutputStream으로 병합
         val outputStream = java.io.ByteArrayOutputStream()
+        Log.d(TAG, "saveWavSegment: $selectedChunks")
         try {
             selectedChunks.forEach { chunk ->
                 outputStream.write(chunk)
@@ -232,6 +236,11 @@ class ExpoAudioRecorder(
 
         // 4. WAV로 변환
         return try {
+            val parentDir = File(customFilePath).parentFile
+            if (parentDir != null && !parentDir.exists()) {
+                val created = parentDir.mkdirs()
+                Log.d(TAG, "📁 상위 디렉토리 생성됨: ${parentDir.absolutePath}, 성공 여부: $created")
+            }
             val wavFile = appendWavHeader(customFilePath, pcmFile, sampleRateInHz)
             Log.i(TAG, "✅ saveWavSegment 성공: ${wavFile.absolutePath}, size=${wavFile.length()} bytes")
             // 🧹 저장 후 .pcm 삭제
@@ -271,5 +280,10 @@ class ExpoAudioRecorder(
             }
         }
         // tempFileOutputStream.close()
+    }
+
+    fun saveFullWav(toTime: Long, customFilePath: String): File? {
+        val fromTime = recordingStartTime
+        return saveWavSegment(fromTime, toTime, customFilePath)
     }
 }
