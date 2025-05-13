@@ -19,6 +19,12 @@ import android.util.Log
 import java.io.File
 import java.net.URI
 import java.util.Locale
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+
 
 data class SpeechRecognitionErrorEvent(
     val error: String,
@@ -75,6 +81,9 @@ class ExpoSpeechService(
 
     // 📌 RMS 기반 저장된 wav 파일 경로 추적
     private var rmsSavedFilePath: String? = null
+
+    private var chunkSaveJob: Job? = null
+    private var chunkStartTime: Long = 0L
 
     // 📌 로그 태그
     private val TAG = "ExpoSpeechService"
@@ -152,6 +161,12 @@ class ExpoSpeechService(
 
                 // Start the audio recorder
                 audioRecorder?.start()
+
+                // ✅ 자동 chunk 저장 시작
+                val directory = options.recordingOptions?.outputDirectory?.removePrefix("file://")
+                    ?: reactContext.cacheDir.absolutePath
+                val prefix = options.recordingOptions?.outputFileName ?: "chunk"
+                startChunkAutoSave(directory, prefix)
 
                 // Start listening
                 speech?.setRecognitionListener(this)
@@ -239,6 +254,27 @@ class ExpoSpeechService(
         teardownAndEnd()
     }
 
+    fun flushCurrentChunk() {
+        if (audioRecorder != null && ::options.isInitialized) {
+            val now = System.currentTimeMillis()
+            val outputDir = options.recordingOptions?.outputDirectory?.removePrefix("file://")
+                ?: reactContext.cacheDir.absolutePath
+            val prefix = options.recordingOptions?.outputFileName ?: "chunk"
+            val fileName = "${prefix}_${now}_forced.wav"
+            val filePath = "$outputDir$fileName"
+
+            val file = audioRecorder?.saveWavSegment(chunkStartTime, now, filePath)
+            if (file != null && file.exists()) {
+                mainHandler.post {
+                    sendEvent("autosave", mapOf("uri" to "file://$filePath"))
+                    Log.d("ExpoSpeechService", "📤 [flushCurrentChunk] 저장 및 전송됨: $filePath")
+                }
+                // 다음 chunk 시작 시점 조정
+                chunkStartTime = now - 10000L // 10초 overlap 유지
+            }
+        }
+    }
+
     /**
      * Stops speech recognition, recording and updates state
      */
@@ -253,6 +289,7 @@ class ExpoSpeechService(
             speech?.destroy()
             stopRecording()
             soundState = SoundState.INACTIVE
+            stopChunkAutoSave()
             sendEvent("end", null)
             recognitionState = state
             delayedFileStreamer?.close()
@@ -689,6 +726,33 @@ class ExpoSpeechService(
         log("🎯 saveWavSegment() 시도: $start ~ $end -> $path")
 
         return audioRecorder?.saveWavSegment(start, end, path)
+    }
+
+    private fun startChunkAutoSave(outputDir: String, prefix: String) {
+        chunkStartTime = System.currentTimeMillis()
+        chunkSaveJob = CoroutineScope(Dispatchers.IO).launch {
+            while (true) {
+                val now = System.currentTimeMillis()
+                val from = chunkStartTime - 10000L // 10초 overlap
+                val to = chunkStartTime + 60000L // 현재 1분, 10분으로 수정예정
+                val fileName = "${prefix}_${chunkStartTime}_auto.wav"
+                val filePath = "$outputDir$fileName"
+                Log.d(TAG, "🔄 [AutoSave] $from ~ $to -> $filePath")
+
+                audioRecorder?.saveWavSegment(from, to, filePath)
+
+                // JS로 전송을 위한 이벤트 발송
+                sendEvent("autosave", mapOf("uri" to "file://$filePath"))
+
+                chunkStartTime += 50000L // 다음 주기는 10초 overlap 10분으로 수정예정
+                delay(60000L) //10분으로 수정예정
+            }
+        }
+    }
+
+    private fun stopChunkAutoSave() {
+        chunkSaveJob?.cancel()
+        chunkSaveJob = null
     }
 
     override fun onResults(results: Bundle?) {
